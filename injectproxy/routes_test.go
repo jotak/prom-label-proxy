@@ -155,6 +155,7 @@ func (m *mockUpstream) Close() {
 }
 
 const proxyLabel = "namespace"
+const proxyLabelOverride = "src_namespace"
 
 func TestWithPassthroughPaths(t *testing.T) {
 	m := newMockUpstream(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { w.Write(okResponse) }))
@@ -262,8 +263,9 @@ func TestWithPassthroughPaths(t *testing.T) {
 
 func TestMatch(t *testing.T) {
 	for _, tc := range []struct {
-		labelv  []string
-		matches []string
+		labelv   []string
+		matches  []string
+		override string
 
 		expCode  int
 		expMatch []string
@@ -336,6 +338,22 @@ func TestMatch(t *testing.T) {
 			},
 			expBody: okResponse,
 		},
+		{
+			// Invalid override.
+			labelv:   []string{"default"},
+			override: "other",
+			matches:  []string{`{job="prometheus"}`, `{__name__=~"job:.*"}`},
+			expCode:  http.StatusBadRequest,
+		},
+		{
+			// Many "match" parameters with override.
+			labelv:   []string{"default"},
+			override: proxyLabelOverride,
+			matches:  []string{`{job="prometheus"}`, `{__name__=~"job:.*"}`},
+			expCode:  http.StatusOK,
+			expMatch: []string{`{job="prometheus",src_namespace=~"default"}`, `{__name__=~"job:.*",src_namespace=~"default"}`},
+			expBody:  okResponse,
+		},
 	} {
 		for _, u := range []string{
 			"http://prometheus.example.com/federate",
@@ -351,7 +369,8 @@ func TestMatch(t *testing.T) {
 				)
 				defer m.Close()
 
-				r, err := NewRoutes(m.url, proxyLabel, HTTPFormEnforcer{ParameterName: proxyLabel}, WithEnabledLabelsAPI())
+				enforcer := HTTPFormEnforcer{ParameterName: proxyLabel, AllowedOverrides: []string{proxyLabelOverride}}
+				r, err := NewRoutes(m.url, proxyLabel, enforcer, WithEnabledLabelsAPI())
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
@@ -366,6 +385,9 @@ func TestMatch(t *testing.T) {
 				}
 				for _, lv := range tc.labelv {
 					q.Add(proxyLabel, lv)
+				}
+				if tc.override != "" {
+					q.Add(labelOverrideParam, tc.override)
 				}
 				u.RawQuery = q.Encode()
 

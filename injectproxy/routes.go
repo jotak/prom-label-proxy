@@ -23,6 +23,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -34,8 +35,9 @@ import (
 )
 
 const (
-	queryParam    = "query"
-	matchersParam = "match[]"
+	queryParam         = "query"
+	matchersParam      = "match[]"
+	labelOverrideParam = "label-override"
 )
 
 type routes struct {
@@ -182,13 +184,14 @@ type ExtractLabeler interface {
 
 // HTTPFormEnforcer enforces a label value extracted from the HTTP form and query parameters.
 type HTTPFormEnforcer struct {
-	ParameterName string
+	ParameterName    string
+	AllowedOverrides []string
 }
 
 // ExtractLabel implements the ExtractLabeler interface.
 func (hff HTTPFormEnforcer) ExtractLabel(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		labelValues, err := hff.getLabelValues(r)
+		labelValues, override, err := hff.getLabelValues(r)
 		if err != nil {
 			prometheusAPIError(w, humanFriendlyErrorMessage(err), http.StatusBadRequest)
 			return
@@ -197,6 +200,7 @@ func (hff HTTPFormEnforcer) ExtractLabel(next http.HandlerFunc) http.Handler {
 		// Remove the proxy label from the query parameters.
 		q := r.URL.Query()
 		q.Del(hff.ParameterName)
+		q.Del(labelOverrideParam)
 		r.URL.RawQuery = q.Encode()
 
 		// Remove the param from the PostForm.
@@ -205,8 +209,9 @@ func (hff HTTPFormEnforcer) ExtractLabel(next http.HandlerFunc) http.Handler {
 				prometheusAPIError(w, fmt.Sprintf("Failed to parse the PostForm: %v", err), http.StatusInternalServerError)
 				return
 			}
-			if r.PostForm.Get(hff.ParameterName) != "" {
+			if r.PostForm.Get(hff.ParameterName) != "" || r.PostForm.Get(labelOverrideParam) != "" {
 				r.PostForm.Del(hff.ParameterName)
+				r.PostForm.Del(labelOverrideParam)
 				newBody := r.PostForm.Encode()
 				// We are replacing request body, close previous one (r.FormValue ensures it is read fully and not nil).
 				_ = r.Body.Close()
@@ -215,22 +220,35 @@ func (hff HTTPFormEnforcer) ExtractLabel(next http.HandlerFunc) http.Handler {
 			}
 		}
 
-		next.ServeHTTP(w, r.WithContext(WithLabelValues(r.Context(), labelValues)))
+		ctx := WithLabelValues(r.Context(), labelValues)
+		if len(override) > 0 {
+			ctx = WithLabelOverride(ctx, override)
+		}
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-func (hff HTTPFormEnforcer) getLabelValues(r *http.Request) ([]string, error) {
+func (hff HTTPFormEnforcer) getLabelValues(r *http.Request) ([]string, string, error) {
 	err := r.ParseForm()
 	if err != nil {
-		return nil, fmt.Errorf("the form data can not be parsed: %w", err)
+		return nil, "", fmt.Errorf("the form data can not be parsed: %w", err)
 	}
 
 	formValues := removeEmptyValues(r.Form[hff.ParameterName])
 	if len(formValues) == 0 {
-		return nil, fmt.Errorf("the %q query parameter must be provided", hff.ParameterName)
+		return nil, "", fmt.Errorf("the %q query parameter must be provided", hff.ParameterName)
 	}
 
-	return formValues, nil
+	var override string
+	overrides := removeEmptyValues(r.Form[labelOverrideParam])
+	if len(overrides) > 0 {
+		if !slices.Contains(hff.AllowedOverrides, overrides[0]) {
+			return nil, "", fmt.Errorf("invalid label override: %s", overrides[0])
+		}
+		override = overrides[0]
+	}
+
+	return formValues, override, nil
 }
 
 // HTTPHeaderEnforcer enforces a label value extracted from the HTTP headers.
@@ -420,7 +438,10 @@ func (r *routes) errorIfRegexpMatch(next http.HandlerFunc) http.HandlerFunc {
 
 type ctxKey int
 
-const keyLabel ctxKey = iota
+const (
+	keyLabel ctxKey = iota
+	keyOverride
+)
 
 // MustLabelValues returns labels (previously stored using WithLabelValue())
 // from the given context.
@@ -462,12 +483,29 @@ func WithLabelValues(ctx context.Context, labels []string) context.Context {
 	return context.WithValue(ctx, keyLabel, labels)
 }
 
+// UseLabelOverride returns a label override if it was previously stored using WithLabelOverride()
+// from the given context.
+func UseLabelOverride(ctx context.Context) string {
+	override, _ := ctx.Value(keyOverride).(string)
+	return override
+}
+
+// WithLabelOverride stores label override in the given context.
+func WithLabelOverride(ctx context.Context, override string) context.Context {
+	return context.WithValue(ctx, keyOverride, override)
+}
+
 func (r *routes) passthrough(w http.ResponseWriter, req *http.Request) {
 	r.handler.ServeHTTP(w, req)
 }
 
 func (r *routes) query(w http.ResponseWriter, req *http.Request) {
 	var matcher *labels.Matcher
+
+	label := UseLabelOverride(req.Context())
+	if label == "" {
+		label = r.label
+	}
 
 	if len(MustLabelValues(req.Context())) > 1 {
 		if r.regexMatch {
@@ -476,7 +514,7 @@ func (r *routes) query(w http.ResponseWriter, req *http.Request) {
 		}
 
 		matcher = &labels.Matcher{
-			Name:  r.label,
+			Name:  label,
 			Type:  labels.MatchRegexp,
 			Value: labelValuesToRegexpString(MustLabelValues(req.Context())),
 		}
@@ -497,7 +535,7 @@ func (r *routes) query(w http.ResponseWriter, req *http.Request) {
 		}
 
 		matcher = &labels.Matcher{
-			Name:  r.label,
+			Name:  label,
 			Type:  matcherType,
 			Value: matcherValue,
 		}
@@ -584,8 +622,12 @@ func enforceQueryValues(e *PromQLEnforcer, v url.Values) (values string, noQuery
 // multiple matchers.
 // See e.g https://prometheus.io/docs/prometheus/latest/querying/api/#querying-metadata
 func (r *routes) matcher(w http.ResponseWriter, req *http.Request) {
+	label := UseLabelOverride(req.Context())
+	if label == "" {
+		label = r.label
+	}
 	matcher := &labels.Matcher{
-		Name:  r.label,
+		Name:  label,
 		Type:  labels.MatchRegexp,
 		Value: labelValuesToRegexpString(MustLabelValues(req.Context())),
 	}
